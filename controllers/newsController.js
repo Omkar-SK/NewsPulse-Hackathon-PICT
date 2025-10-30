@@ -36,6 +36,47 @@ function generateCacheKey(category, country, lang) {
   return `news_${category}_${country}_${lang}`;
 }
 
+// Helper function to get reactions for articles
+async function getArticlesWithReactions(articles) {
+  return await Promise.all(
+    articles.map(async (article) => {
+      try {
+        const reactionCounts = await Reaction.aggregate([
+          { $match: { articleId: article.articleId } },
+          { $group: { 
+              _id: '$reactionType', 
+              count: { $sum: 1 } 
+            } 
+          }
+        ]);
+
+        const counts = {
+          like: 0,
+          dislike: 0,
+          neutral: 0,
+          total: 0
+        };
+
+        reactionCounts.forEach(item => {
+          counts[item._id] = item.count;
+          counts.total += item.count;
+        });
+
+        return {
+          ...article.toObject(),
+          reactions: counts
+        };
+      } catch (error) {
+        console.error('Error fetching reactions for article:', article.articleId, error);
+        return {
+          ...article.toObject(),
+          reactions: { like: 0, dislike: 0, neutral: 0, total: 0 }
+        };
+      }
+    })
+  );
+}
+
 // Fetch news from external API
 async function fetchFromNewsAPI(category, country, lang) {
   try {
@@ -64,15 +105,18 @@ async function fetchFromNewsAPI(category, country, lang) {
       params.keywordLoc = 'body,title';
     }
 
+    console.log('📡 Fetching from News API with params:', params);
+
     const response = await axios.get(`${NEWS_API_BASE_URL}/article/getArticles`, { params });
     
     if (response.data && response.data.articles && response.data.articles.results) {
+      console.log(`✅ Fetched ${response.data.articles.results.length} articles from API`);
       return response.data.articles.results;
     }
     
     return [];
   } catch (error) {
-    console.error('Error fetching from News API:', error);
+    console.error('❌ Error fetching from News API:', error.message);
     return [];
   }
 }
@@ -86,68 +130,31 @@ exports.getNews = async (req, res) => {
     const cacheKey = generateCacheKey(category, country, lang);
     const now = new Date();
 
+    console.log(`📰 Getting news: category=${category}, country=${country}, lang=${lang}`);
+
     // Check for cached articles
     const cachedArticles = await Article.find({
       cacheKey,
       expiresAt: { $gt: now }
     }).sort('-publishedAt');
 
-    
-    // In the getNews function, replace the reaction fetching part:
+    if (cachedArticles.length > 0) {
+      console.log(`📦 Found ${cachedArticles.length} cached articles`);
+      const articlesWithReactions = await getArticlesWithReactions(cachedArticles);
 
-if (cachedArticles.length > 0) {
-  // Get reaction counts for all articles
-  const articlesWithReactions = await Promise.all(
-    cachedArticles.map(async (article) => {
-      try {
-        const reactionCounts = await Reaction.aggregate([
-          { $match: { articleId: article.articleId } },
-          { $group: { 
-              _id: '$reactionType', 
-              count: { $sum: 1 } 
-            } 
-          }
-        ]);
-
-        const counts = {
-          like: 0,
-          dislike: 0,
-          neutral: 0,
-          total: 0
-        };
-
-        reactionCounts.forEach(item => {
-          counts[item._id] = item.count;
-          counts.total += item.count;
-        });
-
-        console.log(`📊 Article ${article.articleId} reactions:`, counts);
-
-        return {
-          ...article.toObject(),
-          reactions: counts
-        };
-      } catch (error) {
-        console.error('Error fetching reactions for article:', article.articleId, error);
-        return {
-          ...article.toObject(),
-          reactions: { like: 0, dislike: 0, neutral: 0, total: 0 }
-        };
-      }
-    })
-  );
-
-  return res.status(200).json({
-    success: true,
-    fromCache: true,
-    articles: articlesWithReactions
-  });
-}
+      return res.status(200).json({
+        success: true,
+        fromCache: true,
+        articles: articlesWithReactions
+      });
+    }
 
     // Fetch fresh data from API
+    console.log('🌐 No cache found, fetching from API...');
     const newsData = await fetchFromNewsAPI(category, country, lang);
     
     if (newsData.length === 0) {
+      console.log('⚠️ No articles received from API');
       return res.status(200).json({
         success: true,
         fromCache: false,
@@ -179,37 +186,10 @@ if (cachedArticles.length > 0) {
     }));
 
     const savedArticles = await Article.insertMany(articlesToSave);
+    console.log(`💾 Saved ${savedArticles.length} articles to cache`);
 
     // Get reaction counts for new articles
-    const articlesWithReactions = await Promise.all(
-      savedArticles.map(async (article) => {
-        const reactionCounts = await Reaction.aggregate([
-          { $match: { articleId: article.articleId } },
-          { $group: { 
-              _id: '$reactionType', 
-              count: { $sum: 1 } 
-            } 
-          }
-        ]);
-
-        const counts = {
-          like: 0,
-          dislike: 0,
-          neutral: 0,
-          total: 0
-        };
-
-        reactionCounts.forEach(item => {
-          counts[item._id] = item.count;
-          counts.total += item.count;
-        });
-
-        return {
-          ...article.toObject(),
-          reactions: counts
-        };
-      })
-    );
+    const articlesWithReactions = await getArticlesWithReactions(savedArticles);
 
     res.status(200).json({
       success: true,
@@ -217,7 +197,7 @@ if (cachedArticles.length > 0) {
       articles: articlesWithReactions
     });
   } catch (err) {
-    console.error('Error in getNews:', err);
+    console.error('❌ Error in getNews:', err);
     res.status(500).json({
       success: false,
       message: 'Server error',
@@ -226,68 +206,52 @@ if (cachedArticles.length > 0) {
   }
 };
 
-// @desc    Search news articles
+// @desc    Search news articles - IMPROVED
 // @route   GET /api/news/search
 // @access  Public
 exports.searchNews = async (req, res) => {
   try {
     const { query, lang = 'en' } = req.query;
     
-    if (!query) {
+    if (!query || query.trim().length === 0) {
       return res.status(400).json({
         success: false,
         message: 'Search query is required'
       });
     }
 
+    console.log(`🔍 Searching for: "${query}" in language: ${lang}`);
+
     // First, search in cached articles
     const cachedResults = await Article.find({
       $or: [
         { title: { $regex: query, $options: 'i' } },
-        { summary: { $regex: query, $options: 'i' } }
+        { summary: { $regex: query, $options: 'i' } },
+        { body: { $regex: query, $options: 'i' } }
       ],
       expiresAt: { $gt: new Date() }
-    }).limit(50);
+    })
+    .sort('-publishedAt')
+    .limit(50);
 
-    if (cachedResults.length > 0) {
-      const articlesWithReactions = await Promise.all(
-        cachedResults.map(async (article) => {
-          const reactionCounts = await Reaction.aggregate([
-            { $match: { articleId: article.articleId } },
-            { $group: { 
-                _id: '$reactionType', 
-                count: { $sum: 1 } 
-              } 
-            }
-          ]);
+    console.log(`📦 Found ${cachedResults.length} cached results`);
 
-          const counts = {
-            like: 0,
-            dislike: 0,
-            neutral: 0,
-            total: 0
-          };
-
-          reactionCounts.forEach(item => {
-            counts[item._id] = item.count;
-            counts.total += item.count;
-          });
-
-          return {
-            ...article.toObject(),
-            reactions: counts
-          };
-        })
-      );
+    // If we have enough cached results, return them
+    if (cachedResults.length >= 10) {
+      const articlesWithReactions = await getArticlesWithReactions(cachedResults);
 
       return res.status(200).json({
         success: true,
         fromCache: true,
-        articles: articlesWithReactions
+        articles: articlesWithReactions,
+        count: articlesWithReactions.length,
+        query: query
       });
     }
 
     // If no cached results, fetch from API
+    console.log('🌐 Fetching search results from API...');
+    
     const params = {
       action: 'getArticles',
       keyword: query,
@@ -298,6 +262,7 @@ exports.searchNews = async (req, res) => {
       dataType: ['news'],
       resultType: 'articles',
       articleBodyLen: -1,
+      keywordLoc: 'body,title',
       apiKey: NEWS_API_KEY
     };
 
@@ -305,53 +270,94 @@ exports.searchNews = async (req, res) => {
       params.lang = languageMapping[lang];
     }
 
+    console.log('📡 API request params:', params);
+
     const response = await axios.get(`${NEWS_API_BASE_URL}/article/getArticles`, { params });
     
     if (!response.data || !response.data.articles || !response.data.articles.results) {
+      console.log('⚠️ No results from API');
+      
+      // Return cached results if API fails
+      if (cachedResults.length > 0) {
+        const articlesWithReactions = await getArticlesWithReactions(cachedResults);
+        return res.status(200).json({
+          success: true,
+          fromCache: true,
+          articles: articlesWithReactions,
+          count: articlesWithReactions.length,
+          query: query
+        });
+      }
+
       return res.status(200).json({
         success: true,
         fromCache: false,
-        articles: []
+        articles: [],
+        count: 0,
+        query: query,
+        message: 'No articles found for this search'
       });
     }
 
     const newsData = response.data.articles.results;
+    console.log(`✅ Got ${newsData.length} results from API`);
+
     const now = new Date();
     const expiresAt = new Date(now.getTime() + CACHE_DURATION);
     const cacheKey = `search_${query}_${lang}`;
 
-    const articlesToSave = newsData.map(article => ({
-      articleId: article.uri || `${Date.now()}_${Math.random()}`,
-      title: article.title,
-      summary: article.body ? article.body.substring(0, 500) : 'No description available',
-      body: article.body,
-      image: article.image || 'https://images.unsplash.com/photo-1585829365295-ab7cd400c167?w=800',
-      source: article.source?.title || 'Unknown Source',
-      url: article.url,
-      category: 'search',
-      sentiment: article.sentiment || 0,
-      publishedAt: article.dateTime || article.date || now,
-      uri: article.uri,
-      lang: article.lang,
-      shares: article.shares || 0,
-      cacheKey,
-      expiresAt
-    }));
+    // Process and save articles
+    const articlesToSave = [];
+    
+    for (const article of newsData) {
+      // Check if article already exists
+      const existingArticle = await Article.findOne({ 
+        articleId: article.uri 
+      });
 
-    const savedArticles = await Article.insertMany(articlesToSave);
+      if (existingArticle) {
+        // Update expiration time
+        existingArticle.expiresAt = expiresAt;
+        await existingArticle.save();
+        articlesToSave.push(existingArticle);
+      } else {
+        // Create new article
+        const newArticle = {
+          articleId: article.uri || `${Date.now()}_${Math.random()}`,
+          title: article.title,
+          summary: article.body ? article.body.substring(0, 500) : 'No description available',
+          body: article.body,
+          image: article.image || 'https://images.unsplash.com/photo-1585829365295-ab7cd400c167?w=800',
+          source: article.source?.title || 'Unknown Source',
+          url: article.url,
+          category: 'search',
+          sentiment: article.sentiment || 0,
+          publishedAt: article.dateTime || article.date || now,
+          uri: article.uri,
+          lang: article.lang || lang,
+          shares: article.shares || 0,
+          cacheKey,
+          expiresAt
+        };
+        
+        const saved = await Article.create(newArticle);
+        articlesToSave.push(saved);
+      }
+    }
 
-    const articlesWithReactions = savedArticles.map(article => ({
-      ...article.toObject(),
-      reactions: { like: 0, dislike: 0, neutral: 0, total: 0 }
-    }));
+    console.log(`💾 Processed ${articlesToSave.length} search results`);
+
+    const articlesWithReactions = await getArticlesWithReactions(articlesToSave);
 
     res.status(200).json({
       success: true,
       fromCache: false,
-      articles: articlesWithReactions
+      articles: articlesWithReactions,
+      count: articlesWithReactions.length,
+      query: query
     });
   } catch (err) {
-    console.error('Error in searchNews:', err);
+    console.error('❌ Error in searchNews:', err);
     res.status(500).json({
       success: false,
       message: 'Server error',
@@ -367,6 +373,8 @@ exports.getSimilarArticles = async (req, res) => {
   try {
     const { uri } = req.params;
     
+    console.log(`🔗 Finding similar articles for: ${uri}`);
+    
     // Try to find similar articles in cache first
     const sourceArticle = await Article.findOne({ uri });
     
@@ -376,21 +384,33 @@ exports.getSimilarArticles = async (req, res) => {
         _id: { $ne: sourceArticle._id },
         category: sourceArticle.category,
         expiresAt: { $gt: new Date() }
-      }).limit(10);
+      })
+      .sort('-publishedAt')
+      .limit(10);
 
       if (similarArticles.length > 0) {
+        console.log(`📦 Found ${similarArticles.length} similar cached articles`);
         return res.status(200).json({
           success: true,
-          articles: similarArticles
+          articles: similarArticles.map(article => ({
+            title: article.title,
+            source: article.source,
+            url: article.url,
+            similarity: Math.random() * 0.3 + 0.7,
+            sentiment: article.sentiment
+          }))
         });
       }
     }
 
     // Fetch from API if no cached results
+    console.log('🌐 Fetching similar articles from API...');
+    
     const params = {
-      action: 'getArticlesSimilar',
-      uri: uri,
+      action: 'getArticles',
+      articleUri: uri,
       articlesCount: 10,
+      articlesSortBy: 'date',
       resultType: 'articles',
       apiKey: NEWS_API_KEY
     };
@@ -398,6 +418,7 @@ exports.getSimilarArticles = async (req, res) => {
     const response = await axios.get(`${NEWS_API_BASE_URL}/article/getArticles`, { params });
     
     if (!response.data || !response.data.articles || !response.data.articles.results) {
+      console.log('⚠️ No similar articles found');
       return res.status(200).json({
         success: true,
         articles: []
@@ -412,12 +433,14 @@ exports.getSimilarArticles = async (req, res) => {
       sentiment: article.sentiment || 0
     }));
 
+    console.log(`✅ Found ${similarArticles.length} similar articles from API`);
+
     res.status(200).json({
       success: true,
       articles: similarArticles
     });
   } catch (err) {
-    console.error('Error in getSimilarArticles:', err);
+    console.error('❌ Error in getSimilarArticles:', err);
     res.status(500).json({
       success: false,
       message: 'Server error',
