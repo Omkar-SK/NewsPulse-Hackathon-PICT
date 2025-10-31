@@ -101,6 +101,7 @@ NewsPulse/
 ├── .gitignore
 ├── package.json
 └── server.js
+```
 
 🛠️ Getting Started (Local)
 1. Clone the repo
